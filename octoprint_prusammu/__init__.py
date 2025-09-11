@@ -168,7 +168,7 @@ class PrusaMMUPlugin(octoprint.plugin.StartupPlugin,
     if str(command) == "skip":
       self._log("_done_prompt SKIP", debug=True)
       self._clean_up_prompt()
-      self._disable_mk4_remap()
+      self._disable_buddy_remap()
       return
 
     self.states[StateKeys.SELECTED_FILAMENT] = command
@@ -178,7 +178,7 @@ class PrusaMMUPlugin(octoprint.plugin.StartupPlugin,
       is_buddy(self.mmu[MmuKeys.PRUSA_VERSION]) and
       self.mmu[MmuKeys.PRUSA_VERSION] is not None
     ):
-      self._enable_mk4_remap(command)
+      self._enable_buddy_remap(command)
 
     self._clean_up_prompt()
 
@@ -191,12 +191,12 @@ class PrusaMMUPlugin(octoprint.plugin.StartupPlugin,
 
   # ======== MK4 Remap ========
 
-  def _enable_mk4_remap(self, command):
-    self._log("_enable_mk4_remap T{}".format(command), debug=True)
+  def _enable_buddy_remap(self, command):
+    self._log("_enable_buddy_remap T{}".format(command), debug=True)
     self.filamentOverride = command
 
-  def _disable_mk4_remap(self):
-    self._log("_disable_mk4_remap", debug=True)
+  def _disable_buddy_remap(self):
+    self._log("_disable_buddy_remap", debug=True)
     self.filamentOverride = None
     return
 
@@ -236,6 +236,11 @@ class PrusaMMUPlugin(octoprint.plugin.StartupPlugin,
       # Figure out what Prusa version we are dealing with (defaults to MK3)
       version = detect_connection_profile(machine_type)
       self._log("_process_firmware: {}".format(version), obj=machine_type, debug=True)
+
+    if not has_shared_tool(version):
+      # XL does not have a true MMU, make sure it is known
+      self._fire_event(PluginEventKeys.MMU_CHANGE, dict(state=MmuStates.IS_TOOLCHANGER, prusaVersion=version))
+      return
 
     # MK4: The MMU doesn't tell us it's ok so if the printer has one assume it is.
     if is_buddy(version):
@@ -313,9 +318,18 @@ class PrusaMMUPlugin(octoprint.plugin.StartupPlugin,
       return None, # suppress
 
     return # passthrough
+  
+  def buddy_gcode_received(self, line):
+    # XL & MK3.5/.9/4/COREONE common functions
 
-  def mk4_gcode_received(self, line):
-    # The MK4 is less verbose. To try and fill that gap we're faking the response and responseData
+    # Nothing for now, maybe M863/M864 response parsing eventually
+
+    if self.mmu[MmuKeys.PRUSA_VERSION] == PrusaProfile.XL:
+      # XL specific functions here
+
+      return # no MMU, get out before MMU functions
+    
+    # The buddy firmware is less verbose. To try and fill that gap we're faking the response and responseData
     # to try and match the information we'd expect to get. Some day I hope prusa gives us back
     # the data we had before.
 
@@ -568,12 +582,12 @@ class PrusaMMUPlugin(octoprint.plugin.StartupPlugin,
     if self.mmu[MmuKeys.PRUSA_VERSION] is None:
       return line
 
-    # MK3.5/3.9/4
+    # MK3.5/3.9/4/COREONE/XL
     if (
       is_buddy(self.mmu[MmuKeys.PRUSA_VERSION]) and
       self.mmu[MmuKeys.PRUSA_VERSION] is not None
     ):
-      self.mk4_gcode_received(line)
+      self.buddy_gcode_received(line)
       return line
 
     # MK3
@@ -782,7 +796,7 @@ class PrusaMMUPlugin(octoprint.plugin.StartupPlugin,
     # Handle disconnected event to set the mmu to Not Found (no printer...)
     if event == Events.DISCONNECTED:
       self._log("on_event {}".format(event), debug=True)
-      self._disable_mk4_remap()
+      self._disable_buddy_remap()
       self._fire_event(PluginEventKeys.MMU_CHANGE, DEFAULT_MMU_STATE.copy())
       return
 
@@ -794,9 +808,13 @@ class PrusaMMUPlugin(octoprint.plugin.StartupPlugin,
     ):
       self._log("on_event {}".format(event), debug=True)
       newMmu = DEFAULT_MMU_STATE.copy()
-      newMmu[MmuKeys.STATE] = MmuStates.OK
+      if(has_shared_tool(self.mmu[MmuKeys.PRUSA_VERSION])):
+        newMmu[MmuKeys.STATE] = MmuStates.OK
+      else:
+        # still is toolchanger
+        newMmu[MmuKeys.STATE] = MmuStates.IS_TOOLCHANGER
       newMmu[MmuKeys.PRUSA_VERSION] = self.mmu[MmuKeys.PRUSA_VERSION]
-      self._disable_mk4_remap()
+      self._disable_buddy_remap()
       self._fire_event(PluginEventKeys.MMU_CHANGE, newMmu)
       return
 

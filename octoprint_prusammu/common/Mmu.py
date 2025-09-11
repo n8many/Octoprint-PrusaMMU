@@ -17,6 +17,7 @@ class MmuStates():
   EJECTING="EJECTING"
   # TODO: Fix, only used for MK4 state tracking, should be accepted in js too.
   UNLOADING_FINAL="UNLOADING_FINAL"
+  IS_TOOLCHANGER="IS_TOOLCHANGER" # for XL
 
 
 class MmuKeys():
