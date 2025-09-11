@@ -24,6 +24,7 @@ class MmuKeys():
   LAST_LINE="lastLine"
   TOOL="tool"
   PREV_TOOL="previousTool"
+  LIVE_TOOL="liveTool" # typically tool, but sometimes a different tool when spooljoin is active
   RESPONSE="response"
   RESPONSE_DATA="responseData"
   PRUSA_VERSION="prusaVersion"
@@ -33,6 +34,7 @@ DEFAULT_MMU_STATE = dict(
   lastLine="",
   tool="",
   previousTool="",
+  liveTool="",
   response="",
   responseData="",
   prusaVersion=None,

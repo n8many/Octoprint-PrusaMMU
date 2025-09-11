@@ -3,7 +3,7 @@ from __future__ import absolute_import, unicode_literals
 from threading import Timer
 from json import dumps
 from flask import abort, jsonify
-from re import search
+from re import search, sub
 
 import octoprint.plugin
 from octoprint.server import user_permission
@@ -14,7 +14,7 @@ from octoprint_prusammu.common.Mmu import MmuStates, MmuKeys, MMU3Codes, \
 from octoprint_prusammu.common.PluginEventKeys import PluginEventKeys
 from octoprint_prusammu.common.SettingsKeys import SettingsKeys
 from octoprint_prusammu.common.StateKeys import StateKeys, DEFAULT_STATE
-from octoprint_prusammu.common.PrusaProfile import PrusaProfile, detect_connection_profile
+from octoprint_prusammu.common.PrusaProfile import PrusaProfile, detect_connection_profile, has_shared_tool, is_buddy
 
 
 # === Constants ===
@@ -150,7 +150,7 @@ class PrusaMMUPlugin(octoprint.plugin.StartupPlugin,
   def _timeout_prompt(self):
     self._log("_timeout_prompt", debug=True)
     # non-MK3 can't use default filament, instead it just defaults to whatever it was sliced with.
-    if self.mmu[MmuKeys.PRUSA_VERSION] == PrusaProfile.MK3:
+    if not is_buddy(self.mmu[MmuKeys.PRUSA_VERSION]):
       # Handle if the user had a default filament
       if (
         self.config[SettingsKeys.USE_DEFAULT_FILAMENT] and
@@ -175,7 +175,7 @@ class PrusaMMUPlugin(octoprint.plugin.StartupPlugin,
 
     # MK4: Enable filament rewrite
     if (
-      self.mmu[MmuKeys.PRUSA_VERSION] != PrusaProfile.MK3 and
+      is_buddy(self.mmu[MmuKeys.PRUSA_VERSION]) and
       self.mmu[MmuKeys.PRUSA_VERSION] is not None
     ):
       self._enable_mk4_remap(command)
@@ -238,7 +238,7 @@ class PrusaMMUPlugin(octoprint.plugin.StartupPlugin,
       self._log("_process_firmware: {}".format(version), obj=machine_type, debug=True)
 
     # MK4: The MMU doesn't tell us it's ok so if the printer has one assume it is.
-    if version != PrusaProfile.MK3:
+    if is_buddy(version):
       self._fire_event(PluginEventKeys.MMU_CHANGE, dict(state=MmuStates.OK, prusaVersion=version))
       return
     
@@ -281,7 +281,7 @@ class PrusaMMUPlugin(octoprint.plugin.StartupPlugin,
     # This blocks non-MK3s from proceeding. For MK4 support see above.
     # ========
     if (
-      self.mmu[MmuKeys.PRUSA_VERSION] != PrusaProfile.MK3 and
+      is_buddy(self.mmu[MmuKeys.PRUSA_VERSION]) and
       self.mmu[MmuKeys.PRUSA_VERSION] is not None
     ):
       return # passthrough
@@ -570,7 +570,7 @@ class PrusaMMUPlugin(octoprint.plugin.StartupPlugin,
 
     # MK3.5/3.9/4
     if (
-      self.mmu[MmuKeys.PRUSA_VERSION] != PrusaProfile.MK3 and
+      is_buddy(self.mmu[MmuKeys.PRUSA_VERSION]) and
       self.mmu[MmuKeys.PRUSA_VERSION] is not None
     ):
       self.mk4_gcode_received(line)
@@ -598,12 +598,107 @@ class PrusaMMUPlugin(octoprint.plugin.StartupPlugin,
 
       # Store the tool value on the tool. We're about to get a loading call.
       self.mmu[MmuKeys.TOOL] = tool
+      if has_shared_tool(self.mmu[MmuKeys.PRUSA_VERSION]):
+        self.mmu[MmuKeys.LIVE_TOOL] = tool # tool is always live tool
       self._log("gcode_sent_hook Tool:{} Prev:{}".format(tool, self.mmu[MmuKeys.PREV_TOOL]),
                 debug=True)
     except:
       pass
 
     return
+  
+  def detect_live_tool_hook(self, comm, parsed_temps):
+    # Using parsed temperatures to determine which T# matches "T"
+    # Used for detecting when the tool changes due to spool join setings
+
+    if has_shared_tool(self.mmu[MmuKeys.PRUSA_VERSION]):
+      # MMU shares tool, live tool detection not needed
+      return # this is only for spool join on XL
+    
+    if not 'T' in parsed_temps.keys():
+      return # no 'T' found, aborting
+    
+    t_live = parsed_temps['T']
+    
+    last_live_tool = self.mmu[MmuKeys.LIVE_TOOL]
+
+    if t_live[1]<=0.0:
+      # If there is no active setpoint identifying the live tool is difficult.
+      # Multiple tools can have the same measured temperature
+      # Live tool only matters while printing, and you can't print while off
+      self.mmu[MmuKeys.LIVE_TOOL] = ""
+      
+      if (self.mmu[MmuKeys.LIVE_TOOL] is not last_live_tool):
+        # fire notification to spool manager, etc about the current running tool
+        self._fire_event(PluginEventKeys.MMU_CHANGE, dict(liveTool=self.mmu[MmuKeys.LIVE_TOOL]))
+
+      return
+    
+    t_tools = {k: v for k, v in parsed_temps.items() if search(TOOL_REGEX, k)}
+
+    active_tools = []
+
+    # Check to find which tools are being actively heated, this can be multiple.
+    # NOTE: T5 (no tool) always has setpoint 0.0 (and measured 6.0) so it will be filtered out here
+    for k, v in t_tools.items():
+      if(v[1]>0.0):
+        active_tools.append(k)
+    
+    if not active_tools:
+      # no active tools
+      self.mmu[MmuKeys.LIVE_TOOL] = ""
+    elif len(active_tools) == 1:
+      # one active tool
+      self.mmu[MmuKeys.LIVE_TOOL]=active_tools[0]
+    else:
+      # more than one active tool, figure out which one is selected by temperature setpoint
+      multiples = False
+      final_tool = None
+      for k in active_tools:
+        if t_live[1]==t_tools[k][1]:
+          if final_tool:
+            multiples = True
+          else:
+            final_tool = k
+            multiples = False
+        else:
+          active_tools.remove(k)
+      if not final_tool:
+          # This is a bug
+          self._log("detect_live_tool_hook detected no matching tool{}".format(active_tools), debug=True)
+
+          # fall back to "tool" here?
+          self.mmu[MmuKeys.LIVE_TOOL] = ""
+
+      if not multiples:
+        self.mmu[MmuKeys.LIVE_TOOL] = final_tool
+      else:
+        # Somehow more than one have the same setpoint
+        # falling back to current temperature from ones that matched setpoint
+        best_diff = abs(t_live[0]) # score to beat
+        multiples = False
+        final_tool = None
+        for k in active_tools:
+          diff = abs(t_live[0]-t_tools[k][0])
+          if diff < best_diff:
+            best_diff = diff
+            final_tool = k
+            multiples = False
+          elif diff == best_diff:
+            multiples = True
+
+        if multiples:
+          # This is very unlikely, just stick with what you already had
+          self._log("detect_live_tool_hook detected multiple tools {}".format(active_tools), debug=True)
+        else:
+          self.mmu[MmuKeys.LIVE_TOOL] = final_tool
+    #end selection
+
+    if (self.mmu[MmuKeys.LIVE_TOOL] is not last_live_tool):
+      self._fire_event(PluginEventKeys.MMU_CHANGE, dict(liveTool=self.mmu[MmuKeys.LIVE_TOOL]))
+      pass
+    return
+
 
   # ======== EventHandlerPlugin ========
 
@@ -620,6 +715,7 @@ class PrusaMMUPlugin(octoprint.plugin.StartupPlugin,
       self.mmu[MmuKeys.STATE] == newPayload[MmuKeys.STATE] and
       self.mmu[MmuKeys.TOOL] == newPayload[MmuKeys.TOOL] and
       self.mmu[MmuKeys.PREV_TOOL] == newPayload[MmuKeys.PREV_TOOL] and
+      self.mmu[MmuKeys.LIVE_TOOL] == newPayload[MmuKeys.LIVE_TOOL] and
       self.mmu[MmuKeys.RESPONSE] == newPayload[MmuKeys.RESPONSE] and
       self.mmu[MmuKeys.RESPONSE_DATA] == newPayload[MmuKeys.RESPONSE_DATA] and
       self.mmu[MmuKeys.PRUSA_VERSION] == newPayload[MmuKeys.PRUSA_VERSION]
@@ -675,7 +771,7 @@ class PrusaMMUPlugin(octoprint.plugin.StartupPlugin,
         self.mmu[MmuKeys.PRUSA_VERSION] = PrusaProfile.MK3
 
       if (
-        self.mmu[MmuKeys.PRUSA_VERSION] != PrusaProfile.MK3 and
+        is_buddy(self.mmu[MmuKeys.PRUSA_VERSION]) and
         self.config[SettingsKeys.ENABLE_PROMPT]
       ):
         self._show_prompt()
@@ -856,6 +952,7 @@ __plugin_hooks__ = {
   "octoprint.comm.protocol.gcode.received": __plugin_implementation__.gcode_received_hook,
   "octoprint.comm.protocol.gcode.sent": __plugin_implementation__.gcode_sent_hook,
   "octoprint.comm.protocol.firmware.info": __plugin_implementation__.firmware_info_hook,
+  "octoprint.comm.protocol.temperatures.received": __plugin_implementation__.detect_live_tool_hook,
   "octoprint.events.register_custom_events":  __plugin_implementation__.register_custom_events,
   "octoprint.plugin.softwareupdate.check_config": __plugin_implementation__.get_update_information,
 }
